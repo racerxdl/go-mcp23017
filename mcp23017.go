@@ -56,6 +56,15 @@ const (
 	HIGH          = true
 )
 
+var cachedRegs = []uint8{
+	_IODIRA,
+	_IODIRB,
+	_GPIOA,
+	_GPIOB,
+	_INTCONA,
+	_INTCONB,
+}
+
 var defaultValues = map[uint8]uint8{
 	_IODIRA:   0xFF,
 	_IPOLA:    0x00,
@@ -86,6 +95,16 @@ var busLocks map[int]*sync.Mutex
 
 func init() {
 	busLocks = make(map[int]*sync.Mutex)
+}
+
+func regIsCacheable(reg uint8) bool {
+	for _, v := range cachedRegs {
+		if v == reg {
+			return true
+		}
+	}
+
+	return false
 }
 
 // SetDefaultPinMode sets the pinMode on Reset
@@ -154,9 +173,11 @@ func (d *Device) Rewrite() error {
 	defer busLocks[d.bus].Unlock()
 
 	for k, v := range d.cachedRegVals {
-		err := d.writeReg(k, v)
-		if err != nil {
-			return fmt.Errorf("error writing register 0x%02x: %s", k, err)
+		if regIsCacheable(k) {
+			err := d.writeReg(k, v)
+			if err != nil {
+				return fmt.Errorf("error writing register 0x%02x: %s", k, err)
+			}
 		}
 	}
 
@@ -207,14 +228,10 @@ func (d *Device) DigitalWrite(pin uint8, level PinLevel) error {
 	}
 
 	bit := bitForPin(pin)
-	addr := regForPin(pin, _OLATA, _OLATB)
+	addr := regForPin(pin, _GPIOA, _GPIOB)
 
-	// Read Current State
-	gpio, err := d.dev.ReadRegU8(addr)
-
-	if err != nil {
-		return err
-	}
+	// Read Current State cached
+	gpio := d.readCacheReg(addr)
 
 	// Set bit
 	gpio = bitWrite(gpio, bit, v)
@@ -430,6 +447,10 @@ func (d *Device) updateRegisterBit(pin, value, portA, portB uint8) error {
 func (d *Device) writeReg(addr, val uint8) error {
 	d.cachedRegVals[addr] = val
 	return d.dev.WriteRegU8(addr, val)
+}
+
+func (d *Device) readCacheReg(addr uint8) uint8 {
+	return d.cachedRegVals[addr]
 }
 
 // endregion
