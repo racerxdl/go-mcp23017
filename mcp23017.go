@@ -7,6 +7,7 @@ package mcp23017
 import (
 	"fmt"
 	"github.com/racerxdl/go-mcp23017/i2c"
+	"sync"
 )
 
 const (
@@ -80,8 +81,34 @@ var defaultValues = map[uint8]uint8{
 	_OLATB:    0x00,
 }
 
+// Same i2c bus can be called from several instances
+var busLocks map[int]*sync.Mutex
+
+func init() {
+	busLocks = make(map[int]*sync.Mutex)
+}
+
+// SetDefaultPinMode sets the pinMode on Reset
+func SetDefaultPinMode(mode PinMode) {
+	if mode == INPUT {
+		defaultValues[_IODIRA] = 0xFF
+		defaultValues[_IODIRB] = 0xFF
+	} else {
+		defaultValues[_IODIRA] = 0x00
+		defaultValues[_IODIRB] = 0x00
+	}
+}
+
+// SetDefaultValues sets the default value on reset
+func SetDefaultValues(portA, portB uint8) {
+	defaultValues[_GPIOA] = portA
+	defaultValues[_GPIOB] = portB
+}
+
 type Device struct {
-	dev *i2c.I2C
+	dev           *i2c.I2C
+	bus           int
+	cachedRegVals map[uint8]uint8
 }
 
 // Open opens a MCP23017 device and returns a handler.
@@ -97,22 +124,49 @@ func Open(bus, devNum uint8) (*Device, error) {
 		return nil, err
 	}
 
+	if _, ok := busLocks[int(bus)]; !ok {
+		busLocks[int(bus)] = &sync.Mutex{}
+	}
+
 	d := &Device{
-		dev: dev,
+		dev:           dev,
+		bus:           int(bus),
+		cachedRegVals: map[uint8]uint8{},
+	}
+
+	for k, v := range defaultValues {
+		d.cachedRegVals[k] = v
 	}
 
 	err = d.Reset()
 
 	if err != nil {
-		dev.Close()
+		_ = dev.Close()
 		return nil, err
 	}
 
 	return d, nil
 }
 
+// Rewrites all registers from cached values
+func (d *Device) Rewrite() error {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
+	for k, v := range d.cachedRegVals {
+		err := d.dev.WriteRegU8(k, v)
+		if err != nil {
+			return fmt.Errorf("error writing register 0x%02x: %s", k, err)
+		}
+	}
+
+	return nil
+}
+
 // Reset resets the register to default values
 func (d *Device) Reset() error {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
 	for k, v := range defaultValues {
 		err := d.dev.WriteRegU8(k, v)
 		if err != nil {
@@ -144,6 +198,9 @@ func (d *Device) IsPresent() bool {
 
 // DigitalWrite sets pin (0-15 range) to specified level
 func (d *Device) DigitalWrite(pin uint8, level PinLevel) error {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
 	v := uint8(0)
 	if level == LOW { // Inverse Logic
 		v = 1
@@ -164,11 +221,17 @@ func (d *Device) DigitalWrite(pin uint8, level PinLevel) error {
 
 	// Write GPIO
 	addr = regForPin(pin, _GPIOA, _GPIOB)
+
+	d.cachedRegVals[addr] = gpio
+
 	return d.dev.WriteRegU8(addr, gpio)
 }
 
 // DigitalRead returns the level of the specified pin (0-15 range)
 func (d *Device) DigitalRead(pin uint8) (PinLevel, error) {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
 	bit := bitForPin(pin)
 	addr := regForPin(pin, _GPIOA, _GPIOB)
 
@@ -197,16 +260,28 @@ func (d *Device) SetPullUp(pin uint8, enabled bool) error {
 
 // WriteGPIOAB sets GPIO AB to specified value
 func (d *Device) WriteGPIOAB(value uint16) error {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
+	d.cachedRegVals[_GPIOA] = uint8(value & 0xFF)
+	d.cachedRegVals[_GPIOB] = uint8(value >> 8 & 0xFF)
+
 	return d.dev.WriteRegU16BE(_GPIOA, value)
 }
 
 // ReadGPIOAB reads both PORT A and B and returns a 16 bit value containing AB
 func (d *Device) ReadGPIOAB() (uint16, error) {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
 	return d.dev.ReadRegU16BE(_GPIOA)
 }
 
 // ReadGPIO reads the specified port and returns it's value
 func (d *Device) ReadGPIO(n DevicePort) (uint8, error) {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
 	p := uint8(_GPIOA)
 	if n == PORTB {
 		p = _GPIOB
@@ -221,6 +296,8 @@ func (d *Device) ReadGPIO(n DevicePort) (uint8, error) {
 // polarity will set LOW or HIGH on interrupt
 // Default values after reset are: false, false, LOW)
 func (d *Device) SetupInterrupts(mirroring, openDrain bool, polarity PinLevel) error {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
 
 	p := uint8(0)
 	if polarity == HIGH {
@@ -251,6 +328,7 @@ func (d *Device) SetupInterrupts(mirroring, openDrain bool, polarity PinLevel) e
 	if err != nil {
 		return err
 	}
+	d.cachedRegVals[_IOCONA] = r
 
 	// Configure Port B
 	r, err = d.dev.ReadRegU8(_IOCONB)
@@ -266,6 +344,7 @@ func (d *Device) SetupInterrupts(mirroring, openDrain bool, polarity PinLevel) e
 	if err != nil {
 		return err
 	}
+	d.cachedRegVals[_IOCONB] = r
 
 	return nil
 }
@@ -273,6 +352,9 @@ func (d *Device) SetupInterrupts(mirroring, openDrain bool, polarity PinLevel) e
 // GetLastInterruptPin returns the last pin that triggered a interrupt.
 // In case of any error (or no interrupt triggered) returns INTERR
 func (d *Device) GetLastInterruptPin() uint8 {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
 	// Check PortA
 	f, err := d.dev.ReadRegU8(_INTFA)
 	if err != nil {
@@ -303,6 +385,10 @@ func (d *Device) GetLastInterruptPin() uint8 {
 // GetLastInterruptPinValue returns the level of the pin that triggered a interrupt by last
 func (d *Device) GetLastInterruptPinValue() (PinLevel, error) {
 	i := d.GetLastInterruptPin()
+
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
 	if i != INTERR {
 		addr := regForPin(i, _INTCAPA, _INTCAPB)
 		bit := bitForPin(i)
@@ -329,6 +415,8 @@ func (d *Device) Close() error {
 
 // region Private
 func (d *Device) updateRegisterBit(pin, value, portA, portB uint8) error {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
 	addr := regForPin(pin, portA, portB)
 	bit := bitForPin(pin)
 
@@ -338,6 +426,8 @@ func (d *Device) updateRegisterBit(pin, value, portA, portB uint8) error {
 	}
 
 	regVal = bitWrite(regVal, bit, value)
+
+	d.cachedRegVals[addr] = regVal
 
 	return d.dev.WriteRegU8(addr, regVal)
 }
