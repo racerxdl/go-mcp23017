@@ -154,7 +154,7 @@ func (d *Device) Rewrite() error {
 	defer busLocks[d.bus].Unlock()
 
 	for k, v := range d.cachedRegVals {
-		err := d.dev.WriteRegU8(k, v)
+		err := d.writeReg(k, v)
 		if err != nil {
 			return fmt.Errorf("error writing register 0x%02x: %s", k, err)
 		}
@@ -168,7 +168,7 @@ func (d *Device) Reset() error {
 	busLocks[d.bus].Lock()
 	defer busLocks[d.bus].Unlock()
 	for k, v := range defaultValues {
-		err := d.dev.WriteRegU8(k, v)
+		err := d.writeReg(k, v)
 		if err != nil {
 			return fmt.Errorf("error setting defaults to device: %s", err)
 		}
@@ -222,9 +222,7 @@ func (d *Device) DigitalWrite(pin uint8, level PinLevel) error {
 	// Write GPIO
 	addr = regForPin(pin, _GPIOA, _GPIOB)
 
-	d.cachedRegVals[addr] = gpio
-
-	return d.dev.WriteRegU8(addr, gpio)
+	return d.writeReg(addr, gpio)
 }
 
 // DigitalRead returns the level of the specified pin (0-15 range)
@@ -324,7 +322,7 @@ func (d *Device) SetupInterrupts(mirroring, openDrain bool, polarity PinLevel) e
 	r = bitWrite(r, 2, od)
 	r = bitWrite(r, 1, p)
 
-	err = d.dev.WriteRegU8(_IOCONA, r)
+	err = d.writeReg(_IOCONA, r)
 	if err != nil {
 		return err
 	}
@@ -340,11 +338,10 @@ func (d *Device) SetupInterrupts(mirroring, openDrain bool, polarity PinLevel) e
 	r = bitWrite(r, 2, od)
 	r = bitWrite(r, 1, p)
 
-	err = d.dev.WriteRegU8(_IOCONB, r)
+	err = d.writeReg(_IOCONB, r)
 	if err != nil {
 		return err
 	}
-	d.cachedRegVals[_IOCONB] = r
 
 	return nil
 }
@@ -427,9 +424,12 @@ func (d *Device) updateRegisterBit(pin, value, portA, portB uint8) error {
 
 	regVal = bitWrite(regVal, bit, value)
 
-	d.cachedRegVals[addr] = regVal
+	return d.writeReg(addr, regVal)
+}
 
-	return d.dev.WriteRegU8(addr, regVal)
+func (d *Device) writeReg(addr, val uint8) error {
+	d.cachedRegVals[addr] = val
+	return d.dev.WriteRegU8(addr, val)
 }
 
 // endregion
